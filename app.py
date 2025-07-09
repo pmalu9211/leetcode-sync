@@ -12,6 +12,8 @@ import time
 import requests
 import threading # To run the sync job in a background thread
 from flask import Flask, request, jsonify # Import Flask components
+from bs4 import BeautifulSoup
+import re
 
 # --- CONFIGURATION ---
 load_dotenv() # Load environment variables from .env file for local development
@@ -27,6 +29,9 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 # --- LeetCode Config ---
 LEETCODE_USER = os.getenv('LEETCODE_USER')
 
+# --- GeeksforGeeks Config ---
+GFG_USER = os.getenv('GFG_USER')
+
 # --- Application Logic Config ---
 INITIAL_CUTOFF_DATETIME_IST_STR = "2025-05-17 08:00:00" # Your original cutoff
 IST_TIMEZONE = pytz.timezone('Asia/Kolkata')
@@ -39,14 +44,17 @@ except Exception as e:
     print(f"Error parsing INITIAL_CUTOFF_DATETIME_IST_STR: {e}")
     INITIAL_CUTOFF_DATETIME_UTC = datetime.now(UTC)
 
-STATE_TABLE_NAME = "leetcode_sync_state"
-STATE_KEY = "last_processed_leetcode_timestamp_utc"
+# Use a more generic state key
+STATE_TABLE_NAME = "sync_state"
+STATE_KEY = "last_processed_timestamp_utc"
 
+# Add a 'Platform' column
+COL_PLATFORM = "Platform"
 COL_TOPIC = "Topic"
 COL_PROBLEM = "Problem"
 COL_CONFIDENCE = "confidence"
 COL_LAST_VISITED = "Last Visited"
-EXPECTED_HEADERS = [COL_TOPIC, COL_PROBLEM, COL_CONFIDENCE, COL_LAST_VISITED]
+EXPECTED_HEADERS = [COL_PLATFORM, COL_TOPIC, COL_PROBLEM, COL_CONFIDENCE, COL_LAST_VISITED]
 
 # --- Initialize Flask App ---
 app = Flask(__name__)
@@ -303,44 +311,133 @@ def fetch_leetcode_submissions(last_processed_ts_utc):
         print(f"No 'recentAcSubmissionList' data found in public API response or data is None. Response: {data}")
     return submissions
 
+def fetch_gfg_submissions(last_processed_ts_utc):
+    """
+    Fetches recent solved problems for a user by simulating the API call
+    made by the GFG profile page.
+    """
+    if not GFG_USER:
+        print("WARNING: GFG_USER environment variable is not set. Skipping GFG sync.")
+        return []
+
+    gfg_username = GFG_USER
+    # This is the specific endpoint the profile page uses to load solved problems
+    url = f"https://www.geeksforgeeks.org/user-profile/problem-solved/{gfg_username}/"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        # This header makes the request look like an AJAX call, which is what the browser does
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    
+    # The request requires the username to be sent in the POST request body
+    payload = {'user': gfg_username}
+
+    print(f"Fetching GFG solved problems for user: {gfg_username}")
+    try:
+        # We need to use a POST request to this endpoint
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching GFG profile data: {e}")
+        return []
+
+    # The response is HTML, so we parse it with BeautifulSoup
+    soup = BeautifulSoup(response.content, 'html.parser')
+    submissions = []
+    
+    # The problems are contained within <a> tags inside a specific div structure
+    # Example structure: <a href="/problems/problem-name/0" class="problem-solved-gfg">Problem Name</a>
+    # The date is a sibling: <span class="problem-solved-date">15 May, 2025</span>
+    problem_links = soup.find_all('a', class_='problem-solved-gfg')
+    
+    if not problem_links:
+        print("Could not find any solved problems in the response from GFG. The page structure may have changed again.")
+        return []
+
+    for link_tag in problem_links:
+        problem_name = link_tag.text.strip()
+        problem_url = "https://www.geeksforgeeks.org" + link_tag['href']
+        
+        # The date is in a sibling span
+        date_tag = link_tag.find_next_sibling('span', class_='problem-solved-date')
+        if not date_tag:
+            continue
+            
+        date_str = date_tag.text.strip()
+        
+        try:
+            # --- IMPORTANT TIMESTAMP NOTE ---
+            # GFG only provides the date (e.g., "06 Jun, 2025"), not the time.
+            # We will parse the date and set the time to midnight UTC for consistency.
+            submission_dt_naive = datetime.strptime(date_str, "%d %b, %Y")
+            submission_dt_utc = UTC.localize(submission_dt_naive)
+
+            if submission_dt_utc > last_processed_ts_utc:
+                submissions.append({
+                    "name": problem_name,
+                    "url": problem_url,
+                    "timestamp_utc": submission_dt_utc,
+                    "topic_tags": ["Practice"], # GFG API doesn't provide specific topics here
+                    "platform": "GFG"
+                })
+        except ValueError:
+            print(f"Warning: Could not parse date '{date_str}' for problem '{problem_name}'. Skipping.")
+            continue
+
+    print(f"Fetched {len(problem_links)} GFG solved problems from API, {len(submissions)} are new.")
+    return submissions
+
 # --- CORE SYNCHRONIZATION LOGIC (was previously main()) ---
 def run_synchronization_logic():
-    # ... (your existing code from the previous version, ensure `sync_job_running = False` is in a finally block if errors can occur) ...
-    global sync_job_running 
-    sync_job_running = True # Set flag at the beginning
-    
+    global sync_job_running
+    sync_job_running = True
+
     try:
         print(f"Synchronization logic started at {datetime.now(IST_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
-        # ... (rest of your sync logic, identical to the previous version) ...
-        if not LEETCODE_USER:
-            print("CRITICAL: LEETCODE_USER environment variable is not set. Cannot proceed.")
-            return # Exit this function
 
         # 1. Initialize DB
-        last_processed_ts_utc = INITIAL_CUTOFF_DATETIME_UTC 
+        last_processed_ts_utc = INITIAL_CUTOFF_DATETIME_UTC
         if DATABASE_URL:
             try:
-                initialize_database() 
+                initialize_database()
                 last_processed_ts_utc = get_last_processed_timestamp()
             except Exception as e:
                 print(f"Error with database initialization or getting last timestamp: {e}. Defaulting to initial cutoff.")
         else:
             print("WARNING: DATABASE_URL not set. State will not be persisted. Using initial cutoff as last processed time.")
-        
-        print(f"Will process LeetCode submissions after: {last_processed_ts_utc}")
 
-        # 2. Fetch LeetCode Submissions
-        try:
-            leetcode_submissions = fetch_leetcode_submissions(last_processed_ts_utc)
-        except Exception as e:
-            print(f"CRITICAL: Failed to fetch LeetCode submissions: {e}")
+        print(f"Will process submissions after: {last_processed_ts_utc}")
+
+        # 2. Fetch Submissions from All Platforms
+        all_new_submissions = []
+        if LEETCODE_USER:
+            try:
+                leetcode_submissions = fetch_leetcode_submissions(last_processed_ts_utc)
+                # Add platform to each submission
+                for sub in leetcode_submissions:
+                    sub['platform'] = 'LeetCode'
+                all_new_submissions.extend(leetcode_submissions)
+            except Exception as e:
+                print(f"CRITICAL: Failed to fetch LeetCode submissions: {e}")
+        else:
+            print("LEETCODE_USER not set, skipping LeetCode.")
+
+
+        if GFG_USER:
+            try:
+                gfg_submissions = fetch_gfg_submissions(last_processed_ts_utc)
+                all_new_submissions.extend(gfg_submissions)
+            except Exception as e:
+                print(f"CRITICAL: Failed to fetch GFG submissions: {e}")
+        else:
+            print("GFG_USER not set, skipping GFG.")
+
+        if not all_new_submissions:
+            print("No new submissions to process from any platform.")
             return
 
-        if not leetcode_submissions:
-            print("No new LeetCode submissions to process since last run.")
-            return
-        
-        leetcode_submissions.sort(key=lambda s: s['timestamp_utc'])
+        all_new_submissions.sort(key=lambda s: s['timestamp_utc'])
         new_max_processed_timestamp_this_run = last_processed_ts_utc
 
         # 3. Get Google Sheet Data
@@ -352,51 +449,49 @@ def run_synchronization_logic():
             print(f"CRITICAL: Failed to get Google Sheet data or client: {e}")
             return
 
-        updates_to_sheet_cells = [] 
-        new_rows_to_add_data = []  
+        updates_to_sheet_cells = []
+        new_rows_to_add_data = []
 
-        for submission in leetcode_submissions:
-            problem_name_from_leetcode = submission['name']
+        for submission in all_new_submissions:
+            problem_name_from_platform = submission['name']
             problem_url = submission['url']
             submission_dt_utc = submission['timestamp_utc']
 
-            if submission_dt_utc <= INITIAL_CUTOFF_DATETIME_UTC: 
+            if submission_dt_utc <= INITIAL_CUTOFF_DATETIME_UTC:
                 continue
-            
-            submission_date_for_sheet = submission_dt_utc.strftime('%m/%d/%Y')
-            problem_hyperlink = f'=HYPERLINK("{problem_url}","{problem_name_from_leetcode}")'
+
+            # NEW: Format timestamp with time
+            submission_datetime_for_sheet = submission_dt_utc.astimezone(IST_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')
+
+            problem_hyperlink = f'=HYPERLINK("{problem_url}","{problem_name_from_platform}")'
             topic = ", ".join(submission.get('topic_tags', ["Uncategorized"]))
+            platform = submission.get('platform', 'Unknown')
 
-            matched_problem_in_sheet = sheet_problems_map.get(problem_name_from_leetcode)
-            
+            matched_problem_in_sheet = sheet_problems_map.get(problem_name_from_platform)
+
             if matched_problem_in_sheet:
-                existing_entry = matched_problem_in_sheet
+                # Update logic remains largely the same, but we update the timestamp
+                row_to_update = matched_problem_in_sheet['row_number']
                 try:
-                    # Ensure existing_entry['last_visited'] is not empty before parsing
-                    current_sheet_date_obj = date.min 
-                    if existing_entry['last_visited']:
-                         current_sheet_date_obj = datetime.strptime(existing_entry['last_visited'], '%m/%d/%Y').date()
-                except ValueError:
-                    current_sheet_date_obj = date.min 
+                    header_list_for_index = EXPECTED_HEADERS
+                    last_visited_col_idx_1based = header_list_for_index.index(COL_LAST_VISITED) + 1
+                    platform_col_idx_1based = header_list_for_index.index(COL_PLATFORM) + 1
 
-                if submission_dt_utc.date() > current_sheet_date_obj:
-                    row_to_update = existing_entry['row_number']
-                    try:
-                        # Find the 'Last Visited' column index (0-based for list, then +1 for gspread Cell)
-                        header_list_for_index = [COL_TOPIC, COL_PROBLEM, COL_CONFIDENCE, COL_LAST_VISITED] # ensure this matches what get_sheet_data uses to build the map
-                        last_visited_col_idx_1based = header_list_for_index.index(COL_LAST_VISITED) + 1
-                        updates_to_sheet_cells.append(gspread.Cell(row_to_update, last_visited_col_idx_1based, submission_date_for_sheet))
-                        print(f"Marking for update '{problem_name_from_leetcode}' (Row {row_to_update}): Last Visited to {submission_date_for_sheet}")
-                    except ValueError:
-                        print(f"ERROR: Could not find '{COL_LAST_VISITED}' in EXPECTED_HEADERS for updating. Check config.")
+                    updates_to_sheet_cells.append(gspread.Cell(row_to_update, last_visited_col_idx_1based, submission_datetime_for_sheet))
+                    updates_to_sheet_cells.append(gspread.Cell(row_to_update, platform_col_idx_1based, platform)) # Also update the platform
+                    print(f"Marking for update '{problem_name_from_platform}' (Row {row_to_update}): Last Visited to {submission_datetime_for_sheet}")
+                except ValueError as e:
+                    print(f"ERROR: Could not find a column in EXPECTED_HEADERS for updating: {e}")
+
             else:
-                new_row_data = [topic, problem_hyperlink, "", submission_date_for_sheet]
+                # NEW: Add platform to the new row
+                new_row_data = [platform, topic, problem_hyperlink, "", submission_datetime_for_sheet]
                 new_rows_to_add_data.append(new_row_data)
-                print(f"Marking for add: '{problem_name_from_leetcode}' with Last Visited {submission_date_for_sheet}")
-            
+                print(f"Marking for add: '{problem_name_from_platform}' from {platform} with Last Visited {submission_datetime_for_sheet}")
+
             if submission_dt_utc > new_max_processed_timestamp_this_run:
                 new_max_processed_timestamp_this_run = submission_dt_utc
-        
+
         if updates_to_sheet_cells:
             try:
                 print(f"Applying {len(updates_to_sheet_cells)} cell updates to the sheet.")
@@ -412,21 +507,18 @@ def run_synchronization_logic():
                 print("New rows added to sheet.")
             except Exception as e:
                 print(f"Error batch adding new rows: {e}")
-                
+
         if DATABASE_URL and new_max_processed_timestamp_this_run > last_processed_ts_utc:
             update_last_processed_timestamp(new_max_processed_timestamp_this_run)
         elif not DATABASE_URL:
             print("DATABASE_URL not set, so not updating last processed timestamp.")
-        elif new_max_processed_timestamp_this_run == last_processed_ts_utc and leetcode_submissions:
-             print("Processed submissions, but the latest submission timestamp matches the last processed. State timestamp remains unchanged.")
-        else: 
-            print("No new problem timestamps processed beyond the last recorded one or no submissions processed. State timestamp remains unchanged.")
+        else:
+            print("No new problem timestamps processed beyond the last recorded one. State timestamp remains unchanged.")
 
         print(f"Synchronization logic finished at {datetime.now(IST_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
 
     finally:
-        sync_job_running = False # Ensure flag is reset even if errors occur
-
+        sync_job_running = False
 
 # --- FLASK API ENDPOINT (Simplified) ---
 @app.route('/trigger-sync', methods=['GET']) # Changed to GET, removed POST
