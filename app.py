@@ -51,8 +51,7 @@ EXPECTED_HEADERS = [COL_TOPIC, COL_PROBLEM, COL_CONFIDENCE, COL_LAST_VISITED]
 # --- Initialize Flask App ---
 app = Flask(__name__)
 
-# --- Global variable to track job status ---
-sync_job_running = False
+
 
 # --- DATABASE HELPER FUNCTIONS (Your existing functions - keep them as they are) ---
 def get_db_connection():
@@ -305,9 +304,6 @@ def fetch_leetcode_submissions(last_processed_ts_utc):
 
 # --- CORE SYNCHRONIZATION LOGIC (was previously main()) ---
 def run_synchronization_logic():
-    # ... (your existing code from the previous version, ensure `sync_job_running = False` is in a finally block if errors can occur) ...
-    global sync_job_running 
-    sync_job_running = True # Set flag at the beginning
     
     try:
         print(f"Synchronization logic started at {datetime.now(IST_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
@@ -424,31 +420,23 @@ def run_synchronization_logic():
 
         print(f"Synchronization logic finished at {datetime.now(IST_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
 
-    finally:
-        sync_job_running = False # Ensure flag is reset even if errors occur
+    
 
 
 # --- FLASK API ENDPOINT (Simplified) ---
 @app.route('/trigger-sync', methods=['GET']) # Changed to GET, removed POST
 def handle_trigger_sync():
-    global sync_job_running
-    
     # WARNING: This endpoint is now unauthenticated. Anyone can trigger it.
     print("Public API trigger received for /trigger-sync (GET).")
 
-    if sync_job_running:
-        print("Sync job trigger requested, but a job is already running.")
-        return jsonify({"status": "warning", "message": "Sync job already in progress. Please try again later."}), 409 # 409 Conflict
-
-    print("Starting synchronization logic in a background thread.")
-    thread = threading.Thread(target=run_synchronization_logic)
-    thread.start()
+    print("Starting synchronization logic directly.")
+    run_synchronization_logic()
     
-    return jsonify({"status": "success", "message": "Synchronization job triggered successfully. Check server logs for progress."}), 202
+    return jsonify({"status": "success", "message": "Synchronization job completed."}), 200
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat(), "job_running": sync_job_running}), 200
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
 
 
 if __name__ == '__main__':
